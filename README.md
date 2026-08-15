@@ -540,3 +540,128 @@ Token Sparse Attention dynamically selects tokens on a per-head basis during lon
 **Sentence-Wise Sparse Attention compresses completed sentences into persistent sentence-level KV representations, while retaining full word-level KV only for the current sentence, creating a hierarchical long-context Transformer that trades fine-grained historical information for much smaller and semantically structured memory.**
 
 > **Potential novelty:** The strongest research angle is not simply "sentence-level attention"—which has prior work—but the combination of **sentence-boundary-triggered token eviction + persistent sentence-token KV cache + current-sentence full-resolution KV + sparse/head-specific information flow** for autoregressive decoding.
+
+---
+## Further experiment
+
+A key direction for further experiement is to investigate whether, within each sentence, only the information that is relevant for predicting the next token can be selected and attend only to those sentences.
+
+### 1. Attention-Based Sentence Selection
+
+Instead of retaining all sentence representations equally, could model identify which previous sentences are most relevant to predicting the next token based on attention scores.
+
+The proposed mechanism could be:
+
+```text
+Current token
+     │
+     ▼
+Sentence relevance scoring
+     │
+     ├── Sentence 1 ── relevance: 0.02
+     ├── Sentence 2 ── relevance: 0.81  ✓
+     ├── Sentence 3 ── relevance: 0.05
+     ├── Sentence 4 ── relevance: 0.73  ✓
+     └── Sentence 5 ── relevance: 0.03
+                 │
+                 ▼
+        Select relevant sentences
+                 │
+                 ▼
+        full attention on selected sentences and current sentence tokens.
+```
+
+### 2. Cheap Relevance Estimation
+
+Computing attention scores over all historical sentences at every decoding step could itself become expensive for very long contexts. Therefore, an important research direction is to investigate whether sentence relevance can be estimated cheaply using dimensionality reduction.
+
+For example:
+
+```text
+Sentence KV
+     │
+     ▼
+Low-dimensional projection
+     │
+     ▼
+Compact sentence embedding
+     │
+     ▼
+Cheap similarity / relevance score
+     │
+     ▼
+Top-k relevant sentences
+```
+
+Possible approaches include learned projections, low-rank representations, random projections, product quantization, or other compact indexing mechanisms.
+
+The goal would be to determine whether sentence selection can be performed at significantly lower computational cost than full attention while preserving retrieval quality.
+
+### 3. Sentence Graph
+
+Another possible direction is to represent the previous sentences as a graph of sentence representations.
+
+```text
+                    Document
+                       │
+             ┌─────────┴─────────┐
+             │                   │
+          Section 1           Section 2
+             │                   │
+        ┌────┴────┐         ┌────┴────┐
+       S₁        S₂        S₃        S₄
+       │         │         │         │
+      ...       ...       ...       ...
+```
+
+Each sentence could be connected to semantically related sentences. During decoding, the model could first identify a relevant region of the graph and then retrieve only the corresponding set of sentences.
+
+```text
+Next-token query
+       │
+       ▼
+ Find relevant sentence
+       │
+       ▼
+ Traverse related nodes
+       │
+       ▼
+ Retrieve relevant sentence set
+       │
+       ▼
+ Detailed attention over selected information
+```
+
+### 4. Combined
+
+The overall system could therefore evolve into:
+
+```text
+                 Next-token query
+                        │
+                        ▼
+              Cheap sentence retrieval
+                        │
+              ┌─────────┴─────────┐
+              ▼                   ▼
+      Low-dimensional        Sentence graph
+       representations        traversal
+              │                   │
+              └─────────┬─────────┘
+                        ▼
+               Relevant sentences
+                        │
+                        ▼
+             Token-level information
+              from selected sentences
+                        │
+                        ▼
+                Next-token prediction
+```
+
+The main research question would be:
+
+> **Can a Transformer efficiently identify and retrieve only the sentences containing information necessary for next-token prediction, using compact sentence representations and a graph based retrieval structure?**
+
+This would extend the proposed sentence-level KV cache from simple compression toward **query-dependent hierarchical memory retrieval**.
+
