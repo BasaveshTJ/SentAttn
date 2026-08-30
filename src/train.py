@@ -1,7 +1,7 @@
 import os
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_dataset_builder
 from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer, Trainer, TrainingArguments, default_data_collator
 
@@ -13,12 +13,11 @@ MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
 DATASET_ID = "HuggingFaceTB/smol-smoltalk"
 OUTPUT_DIR = "./sentence-sparse-smollm2-135m"
 SUBSET = "all"
-NUM_EPOCHS = 5
+NUM_EPOCHS = 1
 MAX_LENGTH = 1024
 TRAIN_BATCH_SIZE = 2
 GRAD_ACCUM_STEPS = 8
 LEARNING_RATE = 1e-4
-STREAM_SAMPLES_PER_EPOCH = 5000
 SEED = 42
 DATALOADER_NUM_WORKERS = 0
 DATALOADER_PIN_MEMORY = False
@@ -45,27 +44,29 @@ def encode_example(messages, tokenizer):
 
 # Streaming dataset wrapper
 class StreamTokenizedDataset(IterableDataset):
-    def __init__(self, tokenizer, sample_limit):
+    def __init__(self, tokenizer, expected_length=None):
         super().__init__()
         self.tokenizer = tokenizer
-        self.sample_limit = sample_limit
+        self.expected_length = expected_length
 
     def __iter__(self):
         ds = load_dataset(DATASET_ID, split="train", streaming=True)
-        count = 0
         for row in ds:
             if "messages" not in row:
                 continue
             ex = encode_example(row["messages"], self.tokenizer)
             yield {k: torch.tensor(v, dtype=torch.long) for k, v in ex.items()}
-            count += 1
-            if self.sample_limit is not None and count >= self.sample_limit:
-                break
+
+    def __len__(self):
+        if self.expected_length is None:
+            raise TypeError("Streaming dataset length is unknown")
+        return self.expected_length
 
 
 def build_train_dataset(tokenizer):
     if SUBSET == "all":
-        return StreamTokenizedDataset(tokenizer=tokenizer, sample_limit=STREAM_SAMPLES_PER_EPOCH)
+        train_size = load_dataset_builder(DATASET_ID).info.splits["train"].num_examples
+        return StreamTokenizedDataset(tokenizer=tokenizer, expected_length=train_size)
     ds = load_dataset(DATASET_ID, split="train")
     ds = ds.filter(lambda x: x["source"] == SUBSET)
     cols = ds.column_names
@@ -101,7 +102,6 @@ def train():
     print("Max length:", MAX_LENGTH)
     print("Train batch size:", TRAIN_BATCH_SIZE)
     print("Grad accumulation steps:", GRAD_ACCUM_STEPS)
-    print("Stream samples/epoch:", STREAM_SAMPLES_PER_EPOCH)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     train_dataset = build_train_dataset(tokenizer)
@@ -121,11 +121,7 @@ def train():
         "dataloader_num_workers": DATALOADER_NUM_WORKERS,
         "dataloader_pin_memory": DATALOADER_PIN_MEMORY,
     }
-    if SUBSET == "all":
-        steps_per_epoch = max(1, STREAM_SAMPLES_PER_EPOCH // (TRAIN_BATCH_SIZE * GRAD_ACCUM_STEPS))
-        args_kwargs.update({"max_steps": steps_per_epoch * NUM_EPOCHS, "save_strategy": "steps", "save_steps": steps_per_epoch})
-    else:
-        args_kwargs.update({"num_train_epochs": NUM_EPOCHS, "save_strategy": "epoch"})
+    args_kwargs.update({"num_train_epochs": NUM_EPOCHS, "save_strategy": "epoch"})
 
     training_args = TrainingArguments(**args_kwargs)
     trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset, data_collator=default_data_collator)
