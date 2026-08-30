@@ -12,15 +12,16 @@ from sentence import SENT_TOKEN, add_sentence_tokens, add_sentence_tokens_from_m
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
 DATASET_ID = "HuggingFaceTB/smol-smoltalk"
 OUTPUT_DIR = "./sentence-sparse-smollm2-135m"
-# SUBSET = "all"
-SUBSET = "everyday-conversations" # for testing, using small dataset
+SUBSET = "all"
 NUM_EPOCHS = 5
 MAX_LENGTH = 1024
-TRAIN_BATCH_SIZE = 4
-GRAD_ACCUM_STEPS = 4
+TRAIN_BATCH_SIZE = 2
+GRAD_ACCUM_STEPS = 8
 LEARNING_RATE = 1e-4
-STREAM_SAMPLES_PER_EPOCH = 20000
+STREAM_SAMPLES_PER_EPOCH = 5000
 SEED = 42
+DATALOADER_NUM_WORKERS = 0
+DATALOADER_PIN_MEMORY = False
 
 
 def ensure_tokenizer(model_id):
@@ -75,6 +76,9 @@ def build_train_dataset(tokenizer):
 
 def train():
     torch.manual_seed(SEED)
+    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    use_fp16 = torch.cuda.is_available() and not use_bf16
+
     tokenizer = ensure_tokenizer(MODEL_ID)
     model = SentenceSparseSmolLM2ForCausalLM.from_pretrained(MODEL_ID)
     model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
@@ -85,6 +89,8 @@ def train():
         model.lm_head.weight[sent_token_id].copy_(model.lm_head.weight[ref_id])
     model.set_sentence_token_id(sent_token_id)
     model.freeze_except_sparse_params()
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable()
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -92,15 +98,18 @@ def train():
     print("Subset:", SUBSET)
     print("Sentence token id:", sent_token_id)
     print("Trainable params:", trainable, "/", total)
+    print("Max length:", MAX_LENGTH)
+    print("Train batch size:", TRAIN_BATCH_SIZE)
+    print("Grad accumulation steps:", GRAD_ACCUM_STEPS)
+    print("Stream samples/epoch:", STREAM_SAMPLES_PER_EPOCH)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     train_dataset = build_train_dataset(tokenizer)
-    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    use_fp16 = torch.cuda.is_available() and not use_bf16
     args_kwargs = {
         "output_dir": OUTPUT_DIR,
         "per_device_train_batch_size": TRAIN_BATCH_SIZE,
         "gradient_accumulation_steps": GRAD_ACCUM_STEPS,
+        "gradient_checkpointing": True,
         "learning_rate": LEARNING_RATE,
         "logging_steps": 50,
         "save_total_limit": 5,
@@ -109,7 +118,8 @@ def train():
         "seed": SEED,
         "bf16": use_bf16,
         "fp16": use_fp16,
-        "dataloader_num_workers": 0,
+        "dataloader_num_workers": DATALOADER_NUM_WORKERS,
+        "dataloader_pin_memory": DATALOADER_PIN_MEMORY,
     }
     if SUBSET == "all":
         steps_per_epoch = max(1, STREAM_SAMPLES_PER_EPOCH // (TRAIN_BATCH_SIZE * GRAD_ACCUM_STEPS))
@@ -127,3 +137,6 @@ def train():
 
 if __name__ == "__main__":
     train()
+
+
+# python -m spacy download en_core_web_sm
