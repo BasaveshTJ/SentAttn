@@ -5,11 +5,11 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from model import SentenceSparseSmolLM2ForCausalLM
-from sentence import SENT_TOKEN, add_sentence_tokens
+from sentence import SENT_TOKEN, add_sentence_tokens, add_sentence_tokens_from_messages
 
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
-FINETUNED_DIR = "./sentence-sparse-smollm2-135m"
+FINETUNED_DIR = "./sentence-sparse-smollm2-135m_edbd445"
 MAX_NEW_TOKENS = 30
 
 
@@ -116,10 +116,11 @@ def run_sparse_attention(prompt, device):
     model.eval()
 
     if isinstance(prompt, list):
-        base_prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+        prompt_text = add_sentence_tokens_from_messages(prompt)
+        base_prompt_text = " ".join([f"{m.get('role', 'user').capitalize()}: {m.get('content', '')}" for m in prompt])
     else:
         base_prompt_text = prompt
-    prompt_text = add_sentence_tokens(base_prompt_text)
+        prompt_text = add_sentence_tokens(base_prompt_text)
     prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0].tolist()
     prompt_tokens = len(prompt_ids)
     completed, active = initial_sparse_state(prompt_text, tokenizer)

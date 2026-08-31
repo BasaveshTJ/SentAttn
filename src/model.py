@@ -28,6 +28,8 @@ class SentenceSparseSmolLM2ForCausalLM(LlamaForCausalLM):
         self.sentence_vector = nn.Parameter(torch.zeros(config.hidden_size))
         self.last_layer_local_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.post_init()
+        with torch.no_grad():
+            self.last_layer_local_proj.weight.zero_()
 
     # Keep new params finite and stable
     def _reset_sparse_params_if_needed(self):
@@ -46,11 +48,9 @@ class SentenceSparseSmolLM2ForCausalLM(LlamaForCausalLM):
 
     # Freeze all except experiment params
     def freeze_except_sparse_params(self):
-        for _, p in self.named_parameters():
-            p.requires_grad = False
-        self.sentence_vector.requires_grad = True
-        for _, p in self.last_layer_local_proj.named_parameters():
-            p.requires_grad = True
+        allowed = {"sentence_vector", "last_layer_local_proj.weight"}
+        for name, p in self.named_parameters():
+            p.requires_grad = name in allowed
 
     # Get sentence segment ids
     def _sentence_ids(self, input_ids):
@@ -61,7 +61,7 @@ class SentenceSparseSmolLM2ForCausalLM(LlamaForCausalLM):
         return sent_ids.clamp_min(0)
 
     # Build sparse mask for one layer type
-    def _build_sparse_mask(self, input_ids, attention_mask_2d=None, last_layer=False, dtype=torch.float32):
+    def _build_sparse_mask(self, input_ids, attention_mask_2d=None, last_layer=False, focus_last_sentence=False, dtype=torch.float32):
         device = input_ids.device
         bsz, seq_len = input_ids.shape
         sent_ids = self._sentence_ids(input_ids)
@@ -77,7 +77,7 @@ class SentenceSparseSmolLM2ForCausalLM(LlamaForCausalLM):
         key_is_sentence = is_sent.unsqueeze(1).expand(-1, seq_len, -1)
         query_is_sentence = is_sent.unsqueeze(2).expand(-1, -1, seq_len)
 
-        if last_layer:
+        if last_layer and focus_last_sentence:
             last_sid = sent_ids.max(dim=1, keepdim=True).values
             q_last = q_sid == last_sid.unsqueeze(2)
             k_last = k_sid == last_sid.unsqueeze(1)
@@ -126,7 +126,15 @@ class SentenceSparseSmolLM2ForCausalLM(LlamaForCausalLM):
         hidden_states = self._inject_sentence_vector(input_ids)
         pos_emb = self.model.rotary_emb(hidden_states, position_ids)
         sparse_mask_penultimate = self._build_sparse_mask(input_ids, attention_mask_2d=attention_mask, last_layer=False, dtype=hidden_states.dtype)
-        sparse_mask_last = self._build_sparse_mask(input_ids, attention_mask_2d=attention_mask, last_layer=True, dtype=hidden_states.dtype)
+        # Training: final layer runs for all sentences.
+        # Inference: final layer focuses only on the last sentence.
+        sparse_mask_last = self._build_sparse_mask(
+            input_ids,
+            attention_mask_2d=attention_mask,
+            last_layer=True,
+            focus_last_sentence=not self.training,
+            dtype=hidden_states.dtype,
+        )
 
         for i, layer in enumerate(self.model.layers):
             layer_mask = sparse_mask_last if i == len(self.model.layers) - 1 else sparse_mask_penultimate
