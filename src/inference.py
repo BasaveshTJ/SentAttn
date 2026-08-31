@@ -5,7 +5,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from model import SentenceSparseSmolLM2ForCausalLM
-from sentence import SENT_TOKEN, add_sentence_tokens, add_sentence_tokens_from_messages
+from sentence import SENT_TOKEN, add_sentence_tokens
 
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
@@ -61,7 +61,18 @@ def run_full_attention(prompt, device):
     full_attn_scores_decode_cache = count_full_decode_attention_scores(prompt_len, generated_tokens, model.config.num_hidden_layers)
     full_kv_slots = count_full_kv_slots(seq_len, model.config.num_hidden_layers)
     text = tokenizer.decode(out[0], skip_special_tokens=True)
-    return {"text": text, "seq_len": seq_len, "prompt_len": prompt_len, "generated_tokens": generated_tokens, "attn_scores_final_seq": full_attn_scores_final_seq, "attn_scores_decode_cache": full_attn_scores_decode_cache, "kv_slots": full_kv_slots}
+    generated_text = tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True)
+    return {
+        "model": "full_attention",
+        "text": text,
+        "generated_text": generated_text,
+        "prompt_tokens": prompt_len,
+        "generated_tokens": generated_tokens,
+        "final_tokens": seq_len,
+        "attn_scores_final_seq": full_attn_scores_final_seq,
+        "attn_scores_decode_cache": full_attn_scores_decode_cache,
+        "kv_slots_created": full_kv_slots,
+    }
 
 
 # Build sparse initial token state
@@ -105,9 +116,12 @@ def run_sparse_attention(prompt, device):
     model.eval()
 
     if isinstance(prompt, list):
-        prompt_text = add_sentence_tokens_from_messages(prompt)
+        base_prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
     else:
-        prompt_text = add_sentence_tokens(prompt)
+        base_prompt_text = prompt
+    prompt_text = add_sentence_tokens(base_prompt_text)
+    prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0].tolist()
+    prompt_tokens = len(prompt_ids)
     completed, active = initial_sparse_state(prompt_text, tokenizer)
     generated = []
     sparse_attn_scores_decode_cache = 0
@@ -147,10 +161,40 @@ def run_sparse_attention(prompt, device):
             active = [sent_id]
 
     final_ids = completed + active
-    text = tokenizer.decode(final_ids, skip_special_tokens=True)
+    generated_text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+    if not generated_text:
+        generated_text = tokenizer.decode(generated, skip_special_tokens=False).replace(SENT_TOKEN, "").strip()
+    text = (base_prompt_text + generated_text).strip()
     kv_sentence_only = num_layers * (len(completed) + len(active))
     active_word_tokens_now = max(len(active) - 1, 0)
-    return {"text": text, "context_tokens": len(completed) + len(active), "attn_scores_decode_cache": sparse_attn_scores_decode_cache, "kv_slots_running": sparse_kv_slots_running, "kv_slots_sentence_only": kv_sentence_only, "active_word_tokens_now": active_word_tokens_now, "peak_active_word_tokens": peak_active_word_tokens, "dropped_word_tokens_total": dropped_word_tokens_total, "sentence_flush_events": sentence_flush_events}
+    return {
+        "model": "sentence_sparse",
+        "text": text,
+        "generated_text": generated_text,
+        "prompt_tokens": prompt_tokens,
+        "generated_tokens": len(generated),
+        "final_tokens": prompt_tokens + len(generated),
+        "attn_scores_final_seq": None,
+        "attn_scores_decode_cache": sparse_attn_scores_decode_cache,
+        "kv_slots_created": sparse_kv_slots_running,
+        "state_tokens_now": len(final_ids),
+        "kv_slots_sentence_only": kv_sentence_only,
+        "active_word_tokens_now": active_word_tokens_now,
+        "peak_active_word_tokens": peak_active_word_tokens,
+        "dropped_word_tokens_total": dropped_word_tokens_total,
+        "sentence_flush_events": sentence_flush_events,
+    }
+
+
+def print_metrics(name, metrics):
+    print(f"==== {name} ====")
+    print("Generated text:", metrics["generated_text"])
+    print("Prompt tokens:", metrics["prompt_tokens"])
+    print("Generated tokens:", metrics["generated_tokens"])
+    print("Final tokens:", metrics["final_tokens"])
+    print("Attention scores (final full matrix):", metrics["attn_scores_final_seq"])
+    print("Attention scores (decode cache-style):", metrics["attn_scores_decode_cache"])
+    print("KV slots created:", metrics["kv_slots_created"])
 
 
 def main():
@@ -170,20 +214,10 @@ def main():
     full = run_full_attention(prompt, device)
     sparse = run_sparse_attention(prompt, device)
 
-    print("==== Full Attention SmolLM2 ====")
-    print("Output:", full["text"])
-    print("Prompt tokens:", full["prompt_len"])
-    print("Generated tokens:", full["generated_tokens"])
-    print("Final tokens:", full["seq_len"])
-    print("Attention scores (final full matrix):", full["attn_scores_final_seq"])
-    print("Attention scores (decode cache-style):", full["attn_scores_decode_cache"])
-    print("KV slots created:", full["kv_slots"])
-
-    print("\n==== Sentence Sparse Fine-tuned Model ====")
-    print("Output:", sparse["text"])
-    print("Current context tokens:", sparse["context_tokens"])
-    print("Attention scores (decode cache-style):", sparse["attn_scores_decode_cache"])
-    print("KV slots created during run:", sparse["kv_slots_running"])
+    print_metrics("Full Attention SmolLM2", full)
+    print()
+    print_metrics("Sentence Sparse Fine-tuned Model", sparse)
+    print("Current sparse state tokens:", sparse["state_tokens_now"])
     print("KV slots with sentence-only memory:", sparse["kv_slots_sentence_only"])
     print("Active sentence word-token cache now:", sparse["active_word_tokens_now"])
     print("Peak active sentence word-token cache:", sparse["peak_active_word_tokens"])
