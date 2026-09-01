@@ -332,12 +332,18 @@ def main():
     args = parser.parse_args()
 
     prompt = [
-        {"content": "Hi there", "role": "user"},
-        {"content": "Hello! How can I help you today?", "role": "assistant"},
         {
-            "content": "I'm looking for a beach resort for my next vacation. Can you recommend some popular ones?",
-            "role": "user",
+            "content": "Hi there", 
+             "role": "user"
         },
+        # {
+        #     "content": "Hello! How can I help you today?", 
+        #     "role": "assistant"
+        # },
+        # {
+        #     "content": "I'm looking for a beach resort for my next vacation. Can you recommend some popular ones?",
+        #     "role": "user",
+        # },
     ]
 
     result = run_sentence_pool_inference(

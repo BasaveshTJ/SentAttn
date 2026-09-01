@@ -11,13 +11,16 @@ from sentence import SENT_TOKEN, add_sentence_tokens, add_sentence_tokens_from_m
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
 DATASET_ID = "HuggingFaceTB/smol-smoltalk"
-OUTPUT_DIR = "./sentence-sparse-smollm2-135m"
+OUTPUT_DIR = "./sentence-sparse-smollm2-135m_66d102a"
 SUBSET = "all"
 NUM_EPOCHS = 1
-MAX_LENGTH = 1024
-TRAIN_BATCH_SIZE = 2
+MAX_LENGTH = 2048
+TRAIN_BATCH_SIZE = 8
 GRAD_ACCUM_STEPS = 8
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-5
+WARMUP_RATIO = 0.03
+WEIGHT_DECAY = 0.01
+MAX_GRAD_NORM = 1.0
 SEED = 42
 DATALOADER_NUM_WORKERS = 0
 DATALOADER_PIN_MEMORY = False
@@ -89,7 +92,8 @@ def train():
         model.model.embed_tokens.weight[sent_token_id].copy_(model.model.embed_tokens.weight[ref_id])
         model.lm_head.weight[sent_token_id].copy_(model.lm_head.weight[ref_id])
     model.set_sentence_token_id(sent_token_id)
-    model.freeze_except_sparse_params()
+    for p in model.parameters():
+        p.requires_grad = True
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
@@ -102,6 +106,10 @@ def train():
     print("Max length:", MAX_LENGTH)
     print("Train batch size:", TRAIN_BATCH_SIZE)
     print("Grad accumulation steps:", GRAD_ACCUM_STEPS)
+    print("Learning rate:", LEARNING_RATE)
+    print("Warmup ratio:", WARMUP_RATIO)
+    print("Weight decay:", WEIGHT_DECAY)
+    print("Max grad norm:", MAX_GRAD_NORM)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     train_dataset = build_train_dataset(tokenizer)
@@ -111,6 +119,9 @@ def train():
         "gradient_accumulation_steps": GRAD_ACCUM_STEPS,
         "gradient_checkpointing": True,
         "learning_rate": LEARNING_RATE,
+        "warmup_ratio": WARMUP_RATIO,
+        "weight_decay": WEIGHT_DECAY,
+        "max_grad_norm": MAX_GRAD_NORM,
         "logging_steps": 50,
         "save_total_limit": 5,
         "remove_unused_columns": False,
