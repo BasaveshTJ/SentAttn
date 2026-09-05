@@ -5,192 +5,155 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from model import SentenceSparseSmolLM2ForCausalLM
-from sentence import SENT_TOKEN, add_sentence_tokens, add_sentence_tokens_from_messages
+from sentence import (
+    SENT_TOKEN,
+    add_sentence_tokens,
+    add_system_sentence_token,
+    add_sentence_tokens_to_messages,
+)
 
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
-# FINETUNED_DIR = "./sentence-sparse-smollm2-135m"
-# FINETUNED_DIR = "./sentence-sparse-smollm2-135m_edbd445"
-# FINETUNED_DIR = "./sentence-sparse-smollm2-135m_66d102a"
-# FINETUNED_DIR = "./sentence-sparse-smollm2-135m_7fcbae4"
-# FINETUNED_DIR = "./sentence-sparse-smollm2-135m_7fcbae4_edc"
-FINETUNED_DIR = "./sentence-local-global-smollm2-135m/checkpoint-432"
+FINETUNED_DIR = "./sentence-sparse-smollm2-135m-all"
 MAX_NEW_TOKENS = 100
 
-
-# Count full attention scores
-def count_full_attention_scores(seq_len, num_layers):
-    return num_layers * (seq_len * (seq_len + 1) // 2)
-
-
-# Count full kv slots
-def count_full_kv_slots(seq_len, num_layers):
-    return num_layers * seq_len
+def attention_scores_per_step(seq_len, model):
+    layers = int(model.config.num_hidden_layers)
+    heads = int(model.config.num_attention_heads)
+    return layers * heads * seq_len * seq_len
 
 
-# Count cache-style full decode attention scores
-def count_full_decode_attention_scores(prompt_len, new_tokens, num_layers):
-    total = 0
-    cur_len = prompt_len
-    for _ in range(new_tokens):
-        total += num_layers * cur_len
-        cur_len += 1
-    return total
-
-
-# Find latest epoch checkpoint
 def latest_checkpoint(path):
-    cks = sorted(glob.glob(os.path.join(path, "checkpoint-epoch-*")))
-    return cks[-1] if cks else path
+    checkpoints = sorted(glob.glob(os.path.join(path, "checkpoint-*")))
+    return checkpoints[-1] if checkpoints else path
 
 
-# Baseline full attention generation
+def load_sparse_model(device):
+    path = latest_checkpoint(FINETUNED_DIR)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Sparse model path not found: {path}. Train or point FINETUNED_DIR to a valid sparse checkpoint."
+        )
+    source = path
+    tokenizer_source = source if os.path.exists(os.path.join(source, "tokenizer.json")) else FINETUNED_DIR
+    if not os.path.exists(os.path.join(tokenizer_source, "tokenizer.json")):
+        raise FileNotFoundError(
+            "Sparse tokenizer files not found in checkpoint or FINETUNED_DIR. "
+            "Save tokenizer with sparse model and retry."
+        )
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
+    tokenizer.add_special_tokens({"additional_special_tokens": [SENT_TOKEN]})
+    model = SentenceSparseSmolLM2ForCausalLM.from_pretrained(
+        source, torch_dtype=torch.float16 if device == "cuda" else torch.float32
+    )
+    model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+    model.set_sentence_token_id(tokenizer.convert_tokens_to_ids(SENT_TOKEN))
+    structural = [tokenizer.convert_tokens_to_ids(t) for t in (
+        "<|im_start|>", "<|im_end|>", "system", "user", "assistant"
+    )]
+    model.set_structural_token_ids(structural)
+    return model.to(device).eval(), tokenizer
+
+
 def run_full_attention(prompt, device):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16 if device == "cuda" else torch.float32).to(device)
-    model.eval()
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, torch_dtype=torch.float16 if device == "cuda" else torch.float32
+    ).to(device).eval()
     if isinstance(prompt, list):
-        inputs = tokenizer.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(device)
+        inputs = tokenizer.apply_chat_template(
+            prompt, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+        ).to(device)
     else:
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    current = inputs["input_ids"]
+    generated = []
+    cumulative_attention_scores = 0
 
-    prompt_len = int(inputs["input_ids"].shape[1])
-    seq_len = out.shape[1]
-    generated_tokens = int(seq_len - prompt_len)
-    full_attn_scores_final_seq = count_full_attention_scores(seq_len, model.config.num_hidden_layers)
-    full_attn_scores_decode_cache = count_full_decode_attention_scores(prompt_len, generated_tokens, model.config.num_hidden_layers)
-    full_kv_slots = count_full_kv_slots(seq_len, model.config.num_hidden_layers)
-    text = tokenizer.decode(out[0], skip_special_tokens=True)
-    generated_text = tokenizer.decode(out[0][prompt_len:], skip_special_tokens=True)
+    for _ in range(MAX_NEW_TOKENS):
+        seq_len = current.shape[1]
+        cumulative_attention_scores += attention_scores_per_step(seq_len, model)
+        with torch.no_grad():
+            logits = model(input_ids=current, attention_mask=torch.ones_like(current)).logits
+        next_id = int(logits[0, -1].argmax())
+        generated.append(next_id)
+        next_token = torch.tensor([[next_id]], device=device, dtype=current.dtype)
+        current = torch.cat([current, next_token], dim=1)
+
     return {
-        "model": "full_attention",
-        "text": text,
-        "generated_text": generated_text,
-        "prompt_tokens": prompt_len,
-        "generated_tokens": generated_tokens,
-        "final_tokens": seq_len,
-        "attn_scores_final_seq": full_attn_scores_final_seq,
-        "attn_scores_decode_cache": full_attn_scores_decode_cache,
-        "kv_slots_created": full_kv_slots,
+        "text": tokenizer.decode(generated, skip_special_tokens=True).strip(),
+        "cumulative_attention_scores": int(cumulative_attention_scores),
+        "generated_tokens": len(generated),
     }
 
 
-# Sparse sentence generation simulation
 def run_sparse_attention(prompt, device):
-    ckpt = latest_checkpoint(FINETUNED_DIR)
-    if os.path.exists(ckpt):
-        print(f"Using checkpoint: {ckpt}")
-    else:
-        print(f"No checkpoint found in {FINETUNED_DIR}, using base model: {MODEL_ID}!!!!!!")
-    tokenizer = AutoTokenizer.from_pretrained(ckpt if os.path.exists(ckpt) else MODEL_ID)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    if SENT_TOKEN not in tokenizer.get_vocab():
-        tokenizer.add_special_tokens({"additional_special_tokens": [SENT_TOKEN]})
-
-    model = SentenceSparseSmolLM2ForCausalLM.from_pretrained(ckpt if os.path.exists(ckpt) else MODEL_ID, torch_dtype=torch.float16 if device == "cuda" else torch.float32)
-    model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
-    sent_id = tokenizer.convert_tokens_to_ids(SENT_TOKEN)
-    model.set_sentence_token_id(sent_id)
-    model.to(device)
-    model.eval()
-
+    model, tokenizer = load_sparse_model(device)
     if isinstance(prompt, list):
-        prompt_text = add_sentence_tokens_from_messages(prompt)
-        base_prompt_text = " ".join([f"{m.get('role', 'user').capitalize()}: {m.get('content', '')}" for m in prompt])
+        text = tokenizer.apply_chat_template(
+            add_sentence_tokens_to_messages(prompt),
+            tokenize=False, add_generation_prompt=True
+        )
+        ids = tokenizer(add_system_sentence_token(text)).input_ids
     else:
-        base_prompt_text = prompt
-        prompt_text = add_sentence_tokens(base_prompt_text)
-
-    # Local attention only ever looks within the current sentence segment, so once a
-    # sentence closes (model predicts a new <|sent|>), its word tokens can never be
-    # attended to again -- only its <|sent|> id needs to stick around for the global
-    # (sent-to-sent) pass. So we drop those word tokens instead of keeping them.
-    ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0].tolist()
-    prompt_tokens = len(ids)
-    sent_positions = [i for i, t in enumerate(ids) if t == sent_id]
-    if sent_positions:
-        completed = [ids[i] for i in sent_positions[:-1]]
-        active = ids[sent_positions[-1]:]
-    else:
-        completed, active = [], ids
-
+        ids = tokenizer(add_sentence_tokens(prompt)).input_ids
+    sent_id = tokenizer.convert_tokens_to_ids(SENT_TOKEN)
+    structural = {
+        tokenizer.convert_tokens_to_ids(t)
+        for t in ("<|im_start|>", "<|im_end|>", "system", "user", "assistant")
+    }
+    last_sent = max((i for i, token in enumerate(ids) if token == sent_id), default=-1)
+    completed = [token for token in ids[:last_sent + 1] if token in structural or token == sent_id]
+    active = ids[last_sent + 1:]
     generated = []
-    num_layers = model.config.num_hidden_layers
+    cumulative_attention_scores = 0
 
     for _ in range(MAX_NEW_TOKENS):
-        cur_ids = completed + active
-        input_ids = torch.tensor([cur_ids], device=device)
-        attention_mask = torch.ones_like(input_ids)
-
+        current = completed + active
+        cumulative_attention_scores += attention_scores_per_step(len(current), model)
+        input_ids = torch.tensor([current], device=device)
         with torch.no_grad():
-            out = model(input_ids=input_ids, attention_mask=attention_mask)
-        next_id = int(torch.argmax(out.logits[0, -1, :]).item())
+            logits = model(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+            )["logits"]
+        next_id = int(logits[0, -1].argmax())
         generated.append(next_id)
-
         if next_id == sent_id:
-            # Sentence just closed: keep only its <|sent|> id, drop its word tokens.
-            completed.append(active[0])
-            active = [next_id]
+            completed += [token for token in active if token in structural] + [next_id]
+            active = []
         else:
             active.append(next_id)
 
-    final_ids = completed + active
-    generated_text = tokenizer.decode(generated, skip_special_tokens=True).strip()
-    if not generated_text:
-        generated_text = tokenizer.decode(generated, skip_special_tokens=False).replace(SENT_TOKEN, "").strip()
-    text = (base_prompt_text + generated_text).strip()
-    seq_len = len(final_ids)
     return {
-        "model": "sentence_sparse",
-        "text": text,
-        "generated_text": generated_text,
-        "prompt_tokens": prompt_tokens,
+        "text": tokenizer.decode(generated, skip_special_tokens=True).strip(),
+        "cumulative_attention_scores": int(cumulative_attention_scores),
         "generated_tokens": len(generated),
-        "final_tokens": seq_len,
-        "attn_scores_final_seq": None,
-        "attn_scores_decode_cache": None,
-        "kv_slots_created": num_layers * seq_len,
     }
 
 
-def print_metrics(name, metrics):
-    print(f"==== {name} ====")
-    print("Generated text:", metrics["generated_text"])
-    print("Prompt tokens:", metrics["prompt_tokens"])
-    print("Generated tokens:", metrics["generated_tokens"])
-    print("Final tokens:", metrics["final_tokens"])
-    print("Attention scores (final full matrix):", metrics["attn_scores_final_seq"])
-    print("Attention scores (decode cache-style):", metrics["attn_scores_decode_cache"])
-    print("KV slots created:", metrics["kv_slots_created"])
-
-
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+if __name__ == "__main__":
     prompt = [
-        {"content": "Hi there", 
-         "role": "user"
-        }, 
-        {"content": "Hello! How can I help you today?", 
-         "role": "assistant"
-        }, 
-        {"content": "I'm looking for a beach resort for my next vacation. Can you recommend some popular ones?", 
-         "role": "user"
-        }
+        {   "content": "Hi there", 
+            "role": "user"
+        },
+        {   "content": "Hello! How can I help you today?", 
+            "role": "assistant"
+        },
+        {
+            "content": "I'm looking for a beach resort for my next vacation. Can you recommend some popular ones?",
+            "role": "user",
+        },
     ]
-
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     full = run_full_attention(prompt, device)
     sparse = run_sparse_attention(prompt, device)
+    print("HuggingFaceTB/SmolLM2-135M-Instruct model results:")
+    print("Full text:", full["text"])
+    print("Full generated tokens:", full["generated_tokens"])
+    print("Full cumulative attention scores:", full["cumulative_attention_scores"])
 
-    print_metrics("Full Attention SmolLM2", full)
-    print()
-    print_metrics("Sentence Sparse Fine-tuned Model", sparse)
-
-
-if __name__ == "__main__":
-    main()
+    print("Sparse attention results:")
+    print("Sparse text:", sparse["text"])
+    print("Sparse generated tokens:", sparse["generated_tokens"])
+    print("Sparse cumulative attention scores:", sparse["cumulative_attention_scores"])

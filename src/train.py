@@ -7,15 +7,15 @@ from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer, Trainer, TrainingArguments, default_data_collator
 
 from model import SentenceSparseSmolLM2ForCausalLM
-from sentence import SENT_TOKEN, add_sentence_tokens, add_sentence_tokens_from_messages
+from sentence import SENT_TOKEN, add_sentence_tokens_to_messages, add_system_sentence_token
 
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
 DATASET_ID = "HuggingFaceTB/smol-smoltalk"
-OUTPUT_DIR = "./sentence-local-global-smollm2-135m-all"
+OUTPUT_DIR = "./sentence-sparse-smollm2-135m-edc"
 RESUME_FROM_CHECKPOINT = None
-SUBSET = "all"
-# SUBSET = "everyday-conversations"
+# SUBSET = "all"
+SUBSET = "everyday-conversations"
 NUM_EPOCHS = 1
 MAX_LENGTH = 1024
 TRAIN_BATCH_SIZE = 8
@@ -41,10 +41,18 @@ def ensure_tokenizer(model_id):
 
 
 def encode_example(messages, tokenizer):
-    text = add_sentence_tokens_from_messages(messages) if isinstance(messages, list) else add_sentence_tokens(tokenizer.apply_chat_template(messages, tokenize=False))
-    tok = tokenizer(text, truncation=True, max_length=MAX_LENGTH, padding="max_length")
-    input_ids = tok["input_ids"]
-    attention_mask = tok["attention_mask"]
+    prepared_messages = add_sentence_tokens_to_messages(messages)
+    text = tokenizer.apply_chat_template(
+        prepared_messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    text = add_system_sentence_token(text)
+    input_ids = tokenizer(text).input_ids[:MAX_LENGTH]
+    attention_mask = [1] * len(input_ids)
+    padding = MAX_LENGTH - len(input_ids)
+    input_ids += [tokenizer.pad_token_id] * padding
+    attention_mask += [0] * padding
     labels = [tid if m == 1 else -100 for tid, m in zip(input_ids, attention_mask)]
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
@@ -94,6 +102,8 @@ def train():
     model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
     sent_token_id = tokenizer.convert_tokens_to_ids(SENT_TOKEN)
     model.set_sentence_token_id(sent_token_id)
+    structural_ids = [tokenizer.convert_tokens_to_ids(t) for t in ("<|im_start|>", "<|im_end|>", "system", "user", "assistant")]
+    model.set_structural_token_ids(structural_ids)
     for p in model.parameters():
         p.requires_grad = True
     model.config.use_cache = False
