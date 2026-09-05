@@ -9,8 +9,8 @@ from sentence import SENT_TOKEN, add_sentence_tokens, add_sentence_tokens_from_m
 
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
-FINETUNED_DIR = "./sentence-sparse-smollm2-135m_edbd445"
-MAX_NEW_TOKENS = 30
+FINETUNED_DIR = "./sentence-sparse-smollm2-135m"
+MAX_NEW_TOKENS = 100
 
 
 # Count full attention scores
@@ -75,22 +75,6 @@ def run_full_attention(prompt, device):
     }
 
 
-# Build sparse initial token state
-def initial_sparse_state(text, tokenizer):
-    marked = text
-    ids = tokenizer(marked, return_tensors="pt").input_ids[0].tolist()
-    sent_id = tokenizer.convert_tokens_to_ids(SENT_TOKEN)
-    sent_pos = [i for i, t in enumerate(ids) if t == sent_id]
-    if not sent_pos:
-        return [], [sent_id] + ids
-    last = sent_pos[-1]
-    completed = []
-    for i in sent_pos[:-1]:
-        completed.append(sent_id)
-    active = ids[last:]
-    return completed, active
-
-
 # Sparse sentence generation simulation
 def run_sparse_attention(prompt, device):
     ckpt = latest_checkpoint(FINETUNED_DIR)
@@ -121,69 +105,46 @@ def run_sparse_attention(prompt, device):
     else:
         base_prompt_text = prompt
         prompt_text = add_sentence_tokens(base_prompt_text)
-    prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0].tolist()
-    prompt_tokens = len(prompt_ids)
-    completed, active = initial_sparse_state(prompt_text, tokenizer)
+
+    # No real KV cache is implemented (the custom sparse mask needs the full
+    # sequence to know sentence boundaries), so we simulate the real workflow
+    # by always feeding back every previous word/sentence token plus the
+    # newly predicted one, and let the model attend under its own local
+    # (same-sentence) + global (sentence-marker) sparse pattern.
+    ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0].tolist()
+    prompt_tokens = len(ids)
     generated = []
-    sparse_attn_scores_decode_cache = 0
-    sparse_kv_slots_running = 0
     num_layers = model.config.num_hidden_layers
-    dropped_word_tokens_total = 0
-    sentence_flush_events = 0
-    peak_active_word_tokens = max(len(active) - 1, 0)
 
     for _ in range(MAX_NEW_TOKENS):
-        ids = completed + active
         input_ids = torch.tensor([ids], device=device)
         attention_mask = torch.ones_like(input_ids)
-
-        # Approximate cache-style decode attention for one new token query.
-        # Non-last layers: current token -> all sentence tokens + active sentence tokens.
-        # Last layer: current token -> active sentence tokens only.
-        num_sentence_tokens = len(completed) + 1
-        active_len = len(active)
-        keys_non_last = num_sentence_tokens + max(active_len - 1, 0)
-        keys_last = active_len
-        sparse_attn_scores_decode_cache += (num_layers - 1) * keys_non_last + keys_last
-        sparse_kv_slots_running += num_layers * len(ids)
 
         with torch.no_grad():
             out = model(input_ids=input_ids, attention_mask=attention_mask)
         next_id = int(torch.argmax(out.logits[0, -1, :]).item())
         generated.append(next_id)
-        active.append(next_id)
-        peak_active_word_tokens = max(peak_active_word_tokens, max(len(active) - 1, 0))
+        ids.append(next_id)
 
         piece = tokenizer.decode([next_id], skip_special_tokens=False)
         if any(x in piece for x in [".", "!", "?"]):
-            dropped_word_tokens_total += max(len(active) - 1, 0)
-            sentence_flush_events += 1
-            completed.append(sent_id)
-            active = [sent_id]
+            ids.append(sent_id)
 
-    final_ids = completed + active
     generated_text = tokenizer.decode(generated, skip_special_tokens=True).strip()
     if not generated_text:
         generated_text = tokenizer.decode(generated, skip_special_tokens=False).replace(SENT_TOKEN, "").strip()
     text = (base_prompt_text + generated_text).strip()
-    kv_sentence_only = num_layers * (len(completed) + len(active))
-    active_word_tokens_now = max(len(active) - 1, 0)
+    seq_len = len(ids)
     return {
         "model": "sentence_sparse",
         "text": text,
         "generated_text": generated_text,
         "prompt_tokens": prompt_tokens,
         "generated_tokens": len(generated),
-        "final_tokens": prompt_tokens + len(generated),
+        "final_tokens": seq_len,
         "attn_scores_final_seq": None,
-        "attn_scores_decode_cache": sparse_attn_scores_decode_cache,
-        "kv_slots_created": sparse_kv_slots_running,
-        "state_tokens_now": len(final_ids),
-        "kv_slots_sentence_only": kv_sentence_only,
-        "active_word_tokens_now": active_word_tokens_now,
-        "peak_active_word_tokens": peak_active_word_tokens,
-        "dropped_word_tokens_total": dropped_word_tokens_total,
-        "sentence_flush_events": sentence_flush_events,
+        "attn_scores_decode_cache": None,
+        "kv_slots_created": num_layers * seq_len,
     }
 
 
@@ -218,12 +179,6 @@ def main():
     print_metrics("Full Attention SmolLM2", full)
     print()
     print_metrics("Sentence Sparse Fine-tuned Model", sparse)
-    print("Current sparse state tokens:", sparse["state_tokens_now"])
-    print("KV slots with sentence-only memory:", sparse["kv_slots_sentence_only"])
-    print("Active sentence word-token cache now:", sparse["active_word_tokens_now"])
-    print("Peak active sentence word-token cache:", sparse["peak_active_word_tokens"])
-    print("Dropped word tokens after sentence end:", sparse["dropped_word_tokens_total"])
-    print("Sentence completion flush events:", sparse["sentence_flush_events"])
 
 
 if __name__ == "__main__":
