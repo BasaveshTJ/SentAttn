@@ -9,7 +9,12 @@ from sentence import SENT_TOKEN, add_sentence_tokens, add_sentence_tokens_from_m
 
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
-FINETUNED_DIR = "./sentence-sparse-smollm2-135m"
+# FINETUNED_DIR = "./sentence-sparse-smollm2-135m"
+# FINETUNED_DIR = "./sentence-sparse-smollm2-135m_edbd445"
+# FINETUNED_DIR = "./sentence-sparse-smollm2-135m_66d102a"
+# FINETUNED_DIR = "./sentence-sparse-smollm2-135m_7fcbae4"
+# FINETUNED_DIR = "./sentence-sparse-smollm2-135m_7fcbae4_edc"
+FINETUNED_DIR = "./sentence-local-global-smollm2-135m/checkpoint-432"
 MAX_NEW_TOKENS = 100
 
 
@@ -91,10 +96,6 @@ def run_sparse_attention(prompt, device):
     model = SentenceSparseSmolLM2ForCausalLM.from_pretrained(ckpt if os.path.exists(ckpt) else MODEL_ID, torch_dtype=torch.float16 if device == "cuda" else torch.float32)
     model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
     sent_id = tokenizer.convert_tokens_to_ids(SENT_TOKEN)
-    with torch.no_grad():
-        ref_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-        model.model.embed_tokens.weight[sent_id].copy_(model.model.embed_tokens.weight[ref_id])
-        model.lm_head.weight[sent_id].copy_(model.lm_head.weight[ref_id])
     model.set_sentence_token_id(sent_id)
     model.to(device)
     model.eval()
@@ -106,35 +107,45 @@ def run_sparse_attention(prompt, device):
         base_prompt_text = prompt
         prompt_text = add_sentence_tokens(base_prompt_text)
 
-    # No real KV cache is implemented (the custom sparse mask needs the full
-    # sequence to know sentence boundaries), so we simulate the real workflow
-    # by always feeding back every previous word/sentence token plus the
-    # newly predicted one, and let the model attend under its own local
-    # (same-sentence) + global (sentence-marker) sparse pattern.
+    # Local attention only ever looks within the current sentence segment, so once a
+    # sentence closes (model predicts a new <|sent|>), its word tokens can never be
+    # attended to again -- only its <|sent|> id needs to stick around for the global
+    # (sent-to-sent) pass. So we drop those word tokens instead of keeping them.
     ids = tokenizer(prompt_text, return_tensors="pt").input_ids[0].tolist()
     prompt_tokens = len(ids)
+    sent_positions = [i for i, t in enumerate(ids) if t == sent_id]
+    if sent_positions:
+        completed = [ids[i] for i in sent_positions[:-1]]
+        active = ids[sent_positions[-1]:]
+    else:
+        completed, active = [], ids
+
     generated = []
     num_layers = model.config.num_hidden_layers
 
     for _ in range(MAX_NEW_TOKENS):
-        input_ids = torch.tensor([ids], device=device)
+        cur_ids = completed + active
+        input_ids = torch.tensor([cur_ids], device=device)
         attention_mask = torch.ones_like(input_ids)
 
         with torch.no_grad():
             out = model(input_ids=input_ids, attention_mask=attention_mask)
         next_id = int(torch.argmax(out.logits[0, -1, :]).item())
         generated.append(next_id)
-        ids.append(next_id)
 
-        piece = tokenizer.decode([next_id], skip_special_tokens=False)
-        if any(x in piece for x in [".", "!", "?"]):
-            ids.append(sent_id)
+        if next_id == sent_id:
+            # Sentence just closed: keep only its <|sent|> id, drop its word tokens.
+            completed.append(active[0])
+            active = [next_id]
+        else:
+            active.append(next_id)
 
+    final_ids = completed + active
     generated_text = tokenizer.decode(generated, skip_special_tokens=True).strip()
     if not generated_text:
         generated_text = tokenizer.decode(generated, skip_special_tokens=False).replace(SENT_TOKEN, "").strip()
     text = (base_prompt_text + generated_text).strip()
-    seq_len = len(ids)
+    seq_len = len(final_ids)
     return {
         "model": "sentence_sparse",
         "text": text,

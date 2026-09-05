@@ -1,4 +1,5 @@
 import os
+import math
 
 import torch
 from datasets import load_dataset, load_dataset_builder
@@ -11,16 +12,19 @@ from sentence import SENT_TOKEN, add_sentence_tokens, add_sentence_tokens_from_m
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
 DATASET_ID = "HuggingFaceTB/smol-smoltalk"
-OUTPUT_DIR = "./sentence-sparse-smollm2-135m_66d102a"
+OUTPUT_DIR = "./sentence-local-global-smollm2-135m-all"
+RESUME_FROM_CHECKPOINT = None
 SUBSET = "all"
+# SUBSET = "everyday-conversations"
 NUM_EPOCHS = 1
-MAX_LENGTH = 2048
+MAX_LENGTH = 1024
 TRAIN_BATCH_SIZE = 8
 GRAD_ACCUM_STEPS = 8
-LEARNING_RATE = 1e-5
-WARMUP_RATIO = 0.03
+LEARNING_RATE = 2e-4
+WARMUP_RATIO = 0.001
 WEIGHT_DECAY = 0.01
 MAX_GRAD_NORM = 1.0
+USE_GRAD_CHECKPOINTING = False
 SEED = 42
 DATALOADER_NUM_WORKERS = 0
 DATALOADER_PIN_MEMORY = False
@@ -80,22 +84,21 @@ def build_train_dataset(tokenizer):
 
 def train():
     torch.manual_seed(SEED)
-    use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    use_fp16 = torch.cuda.is_available() and not use_bf16
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this training setup")
+    use_bf16 = False
+    use_fp16 = False
 
     tokenizer = ensure_tokenizer(MODEL_ID)
-    model = SentenceSparseSmolLM2ForCausalLM.from_pretrained(MODEL_ID)
+    model = SentenceSparseSmolLM2ForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float32)
     model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
     sent_token_id = tokenizer.convert_tokens_to_ids(SENT_TOKEN)
-    with torch.no_grad():
-        ref_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-        model.model.embed_tokens.weight[sent_token_id].copy_(model.model.embed_tokens.weight[ref_id])
-        model.lm_head.weight[sent_token_id].copy_(model.lm_head.weight[ref_id])
     model.set_sentence_token_id(sent_token_id)
     for p in model.parameters():
         p.requires_grad = True
     model.config.use_cache = False
-    model.gradient_checkpointing_enable()
+    if USE_GRAD_CHECKPOINTING:
+        model.gradient_checkpointing_enable()
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -110,16 +113,26 @@ def train():
     print("Warmup ratio:", WARMUP_RATIO)
     print("Weight decay:", WEIGHT_DECAY)
     print("Max grad norm:", MAX_GRAD_NORM)
+    print("Gradient checkpointing:", USE_GRAD_CHECKPOINTING)
+    print("Precision mode: fp32")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     train_dataset = build_train_dataset(tokenizer)
+    train_examples = len(train_dataset)
+    micro_batches_per_epoch = math.ceil(train_examples / TRAIN_BATCH_SIZE)
+    update_steps_per_epoch = max(1, math.ceil(micro_batches_per_epoch / GRAD_ACCUM_STEPS))
+    total_update_steps = max(1, update_steps_per_epoch * NUM_EPOCHS)
+    warmup_steps = max(1, int(total_update_steps * WARMUP_RATIO))
+    print("Warmup steps:", warmup_steps)
+
     args_kwargs = {
         "output_dir": OUTPUT_DIR,
         "per_device_train_batch_size": TRAIN_BATCH_SIZE,
         "gradient_accumulation_steps": GRAD_ACCUM_STEPS,
-        "gradient_checkpointing": True,
+        "gradient_checkpointing": USE_GRAD_CHECKPOINTING,
         "learning_rate": LEARNING_RATE,
-        "warmup_ratio": WARMUP_RATIO,
+        "warmup_steps": warmup_steps,
+        "lr_scheduler_type": "constant",
         "weight_decay": WEIGHT_DECAY,
         "max_grad_norm": MAX_GRAD_NORM,
         "logging_steps": 50,
@@ -136,7 +149,12 @@ def train():
 
     training_args = TrainingArguments(**args_kwargs)
     trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset, data_collator=default_data_collator)
-    trainer.train()
+
+    if RESUME_FROM_CHECKPOINT is not None:
+        print("Resuming from checkpoint:", RESUME_FROM_CHECKPOINT)
+    else:
+        print("Starting training from scratch")
+    trainer.train(resume_from_checkpoint=RESUME_FROM_CHECKPOINT)
     trainer.save_model(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
     print("Training completed")

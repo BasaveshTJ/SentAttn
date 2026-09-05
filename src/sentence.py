@@ -1,6 +1,6 @@
 import spacy
 
-SENT_TOKEN = "<SENT>"
+SENT_TOKEN = "<|sent|>"
 _NLP = None
 
 
