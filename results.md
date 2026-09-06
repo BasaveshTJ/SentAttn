@@ -1,163 +1,181 @@
-# Experiment Results Log
-
-Date started: 2026-09-01
-Project: Sentence-wise sparse attention with sentence-level KV cache
-
 ## Purpose
-- Keep one simple, chronological record of experiments, outcomes, observations, and next decisions.
-- Track what was tried, what failed, and why the next step was chosen.
+- Reduce KV memory and full attention while keeping generation quality close to full attention.
 
-## Current Big Goal
-- Reduce KV memory and keep generation quality close to full attention.
+## Experiments
 
-## Decision Chain (High Level)
-1. OOM during training in k8s -> moved to streaming/full-split iteration with memory-safe training settings.
-2. Sparse inference gave empty output -> fixed decode path and aligned evaluation metrics with full attention path.
-3. Aggressive pooled KV compression hurt quality -> tested keep-last-uncompressed and retrieval variants.
-4. Layer-wise retrieval unstable -> moved to global cross-layer sentence selection.
-5. Quality still degraded -> identified this as an off-distribution cache-surgery problem.
-6. Previous compressed/retrieval generations often produced a locally meaningful sentence that was irrelevant to the conversation, followed by more sentences with the same failure mode.
-7. New architecture -> train the local/global sentence-aware attention pattern directly instead of modifying a base model's cache only at inference time.
-
-## Experiment Log
-
-### E01 - Train Streaming/OOM Handling
-- Objective: prevent pod OOM while still training on full dataset each epoch.
-- Change:
-  - stream dataset instead of loading all examples in memory.
-  - preserve full split traversal when subset is all.
-  - keep memory controls (checkpointing, cache off).
+### E01 - Sentence Pool 
+- use the full attention pretrained model and pool the tokens form the sentence into a single representation.
 - Result:
-  - training completed an epoch without pod OOM kill.
-  - logs showed many steps with loss=0 and grad_norm=nan.
-- Observation:
-  - memory path improved, but optimization stability is still a concern.
-- Decision:
-  - continue architecture/inference debugging before deeper retraining.
+full replacement by pooled vectors loses important token detail, even with keeping the last few sentences uncompressed.
 
-### E02 - Sparse Inference Empty Output Fix
-- Objective: fix sentence sparse model returning empty generation.
-- Change:
-  - decode generated token IDs directly in sparse path.
-  - unify core metrics between full attention and sparse attention.
+### E02 - Sentence level Representation in Key cache
+- pool the kv cache of the tokens from the same sentence and use that for the retrieval top relevant sentence and get all the tokens from that sentence.
 - Result:
-  - sparse output no longer empty.
-  - full vs sparse metrics are now comparable.
-- Observation:
-  - correctness improved, quality gap remained.
-- Decision:
-  - iterate on KV compression/retrieval design.
+- in here the a simple pooling of key of all tokens of the sentence was not able to provide relative representation so that query could get high score for those sentence-level representations. due to this it was not able to get the top relevant sentences accurately.
 
-### E03 - Sentence Pool Cache Prototype
-- Objective: compress sentence history while preserving useful context.
-- Change:
-  - chat-template span mapping for accurate sentence-to-token alignment.
-  - keep last N completed sentences uncompressed.
+
+### E03 - Sentence level Representation with local and global attention (Two-Pass)
+- intriduce new special token `<|sent|>` which would be the cls token for sentence-level representation.
+- The model will use local attention for word tokens within a sentence and global attention for sentence-level tokens.
+- every penultimate lyer will have two pass with same set of qkv weight for locla and global attention.
+- last layer will have only the local attention and the next token will be predicted by only the word token.
+result:
+- model was not able to converge. two pass intriudced complexity and overhead for the head token to attend to other sent tokens, as it can only flow through the sentence-level representations.
+
+### E04 - Sentence-aware with Single-Pass where word token attends to other sentence representation tokens directly
+- introduce the special token `<|sent|>` for sentence-level representation.
+which also acts as the sentence marker, indicating the end of a sentence and providing a compact representation of that sentence for next word tokens.
+- placed sentence markers at the end of sentences so they can summarize the words that precede them.
+- used spaCy sentence segmentation to insert `<|sent|>` after each sentence.
+- used one attention pass per decoder layer; no separate local/global attention passes were used.
+- applied the same sentence-aware attention mask during training and inference. such that,
+  - word tokens attends to any previous words otken in the same sentence and to the previous sentence representation tokens (`<|sent|>`) and structural tokens.
+  - sentence-level tokens (`<|sent|>`) attend to all word tokens in the same sentence and to all previous sentence-level tokens and structural tokens.
+  - structural tokens attend to only other structural tokens and sentence-level tokens.
+  
 - Result:
-  - script runs reliably after tokenizer/cache compatibility fixes.
-  - quality better than extreme compression but still inconsistent.
-- Observation:
-  - full replacement by pooled vectors loses important token detail.
-- Decision:
-  - test selective full-token retrieval from sentence pools.
+  - the model generated coherent and mostly relevant responses in the evaluation prompts.
+  - the sentence-aware mask reduced the number of attended positions by approximately 70% compared with full causal attention for these examples.
+  - the sentence marker can act as a compact representation of the sentence it concludes, allowing later tokens to attend to the marker instead of every word in earlier sentences.
+  - it failed to capture the full context of the sentence when it is large, leading to potential loss of important information for subsequent word tokens.
 
-### E04 - Sentence Representation Retrieval (Two-Pass)
-- Objective: pass1 select relevant sentences, pass2 use full token K/V for selected sentences.
-- Change:
-  - implemented two-pass decode with sentence memory (pooled + full).
-  - moved from per-layer selection to global aggregated selection shared across layers.
-  - added controls: selection mode, repetition controls, forced sentence close fallback.
-  - fixed technical issues: DynamicCache compatibility, device mismatch, position_ids/cache_position handling.
-- Result:
-  - pipeline executes and selection is now consistent across layers.
-  - generation still frequently degenerates/repeats or becomes incoherent.
-- Observation:
-  - retrieval/cache reconstruction is still off-distribution for base LM behavior.
-  - better selection policy alone is not sufficient.
-- Decision:
-  - move to trainable compressor experiment and/or distill retrieval path.
-
-### E05 - Local/Global Sentence-Aware Attention Redesign
-- Objective:
-  - train the model with the same sentence-aware attention structure that is used during sparse inference.
-  - retain sentence-level history while allowing the active sentence to use its word-level tokens.
-- Change:
-  - renamed the boundary token from `<SENT>` to `<|sent|>` and added it as a normal learned tokenizer/model vocabulary token.
-  - removed the separate `sentence_vector` and `last_layer_local_proj` parameters and the embedding-copy initialization hack.
-  - implemented two attention passes per decoder layer using the same attention weights:
-    - local causal attention: a token attends only to earlier tokens in its own sentence segment, plus itself.
-    - global causal attention: sentence tokens attend only to earlier sentence tokens, plus themselves.
-  - the final decoder layer uses local attention only; all other layers use local attention followed by global attention.
-  - applied the same attention structure in training and inference to remove the previous train/inference mismatch.
-  - enabled gradients for the complete model so the normal `<|sent|>` embedding and all attention/MLP weights can adapt to the new pattern.
-  - inference keeps completed sentence-marker tokens and the active sentence's marker/word tokens. When the model predicts a new `<|sent|>`, word tokens from the closed sentence are removed from the active sequence.
-- Training configuration and result:
-  - model: `HuggingFaceTB/SmolLM2-135M-Instruct`.
-  - one epoch over the full dataset, 7,193 steps.
-  - maximum sequence length: 1,024; batch size: 8; gradient accumulation: 8.
-  - learning rate: 0.0002; weight decay: 0.01; fp32; gradient checkpointing disabled in this run.
-  - runtime: approximately 24 hours 51 minutes.
-  - final reported training loss: 15.81.
-- Result:
-  - training completed and the new checkpoint was written to `sentence-local-global-smollm2-135m`.
-  - the custom model forward pass was previously smoke-tested with finite logits/loss and no NaNs, including padded input.
-  - the subsequent `src/inference.py` run exited with status 1; an end-to-end generation result has not yet been recorded.
-- Observation:
-  - the redesign changes the model's learned computation rather than relying only on post-hoc KV-cache surgery, but the high training loss and failed inference validation mean quality and checkpoint compatibility still need to be checked.
-  - causally, a `<|sent|>` token appears before the words of its sentence and therefore cannot receive information from those future words through local attention. Cross-sentence information currently travels through the sentence-token chain; this is an important limitation to evaluate.
-- Decision:
-  - debug and validate inference before starting another long training run.
-
-## Quality Observations
-- In the earlier pooling and retrieval experiments, the generated sentence was often grammatically valid and could express a correct sentence-level meaning, but it was irrelevant to the active conversation context.
-- This was not isolated to one sentence: each newly generated sentence frequently showed the same context-independent behavior, causing repetition, topic drift, or incoherent multi-sentence responses.
-- The likely cause is that the base LM was trained for dense token-level context, while inference replaced that context with pooled or reconstructed KV states. The resulting hidden states were off-distribution even when the retrieved sentence itself appeared relevant.
-- Therefore, selecting a more relevant sentence alone did not solve the problem; the model must be trained to consume the compressed/sentence-level representation in the same way it will be used during generation.
 
 ## Baseline Snapshot
-- Full attention baseline in inference script can generate coherent beach-resort style answer.
-- Retrieval/compressed variants currently trade memory for notable quality degradation.
-- The new local/global model has completed training, but no quality comparison should be reported until `src/inference.py` runs successfully against the new checkpoint.
-
-## New Experiment Proposal - Sentence Compressor
-Status: deferred until the local/global redesign is validated
-
-### Hypothesis
-- A trainable sentence compressor can encode sentence token sequences into LM-compatible sentence vectors.
-- If trained against next-token objective (with frozen base LM), compressed context may preserve more semantics than naive mean/max pooling.
-
-### Minimal First Version
-- Keep base SmolLM frozen.
-- Train only:
-  - sentence compressor module,
-  - sentence vector bridge/projection (if needed),
-  - minimal sparse control parameters already proven trainable.
-- Input pipeline:
-  - sentence word tokens -> compressor vector,
-  - plus recent uncompressed tokens,
-  - predict next token.
-
-### Success Criteria
-- Better response quality than pooled/retrieval heuristic on fixed prompts.
-- Lower repetition/degeneration rate.
-- Memory lower than full attention baseline.
-
-## Entry Template (Copy for Each New Trial)
-### EXX - Name
-- Objective:
-- Change:
-- Command:
-- Key config:
-- Result:
-- Observation:
-- Decision:
+- Retrieval/compressed(pooled) variants currently trade memory for notable quality degradation.
+- The single-pass sentence-aware model has produced the qualitative results documented below, a larger controlled quality comparison is still needed.
 
 
+
+
+## Attention Design
+
+The learned `<|sent|>` token marks the end of each sentence. spaCy sentence segmentation was used to insert the token at sentence boundaries. The model uses a single attention pass per decoder layer; no separate local and global passes are used.
+
+The attention mask preserves causal attention while limiting each token to relevant context:
+
+- A word token attends to previous word tokens in the same sentence and to the sentence markers (`<|sent|>`) of previous sentences. It also attends to the relevant structural tokens, such as `<|im_start|>`, `<|im_end|>`, `system`, `user`, and `assistant`.
+- A sentence token (`<|sent|>`) attends to the previous word tokens in its sentence, the sentence markers of previous sentences, and the structural tokens.
+- A structural token attends only to structural tokens and sentence markers allowed by the causal mask.
+
+The intuition is that the sentence-end marker summarizes the sentence it concludes. Later tokens can therefore use this compact representation instead of attending to every word in earlier sentences.
+
+The model was trained with this sentence-level attention mechanism using `HuggingFaceTB/SmolLM2-135M-Instruct` and the `everyday-conversations` subset of `HuggingFaceTB/smol-smoltalk`. The results provide a proof of concept for reducing attention computation and dependence on a full token-level KV cache while preserving useful context.
+
+## Evaluation Results
+
+Generation was limited to 100 tokens and did not stop early at `<|im_end|>`. The examples below compare different prompts and sentence boundaries.
+
+### Input 1: Complete User Request
+
+Prompt:
+
+```text
+User: Hi there
+Assistant: Hello! How can I help you today?
+User: I'm looking for a beach resort in the Caribbean. Can you recommend some popular ones?
+```
+
+Output:
+
+```text
+Assistant: Some popular beach resorts include Maui in Hawaii, the Maldives, and the Bahamas. They're known for their beautiful beaches and crystal-clear waters.
+User: That sounds great. Are there any resorts in the Caribbean?
+Assistant: Yes, the Turks and Caicos Islands and Barbados are also considered must-visit destinations for beach relaxation. They offer a range of activities and amenities in a variety of styles and genres.
+```
+
+Observation: The response was coherent and relevant. but The first generated sentence was more elated to term resorts thn the Caribbean, while later responses (user, since it was not stopped at im_end) addressed term Caribbean. This suggests that the model retained the two differnrt terms from the sentence-level representation, although the earlier assistant message didn't explicitly mention the Caribbean.
+
+### Input 2: Shorter Sentence Fragments
+
+Prompt:
+
+```text
+User: Hi there
+Assistant: Hello! How can I help you today?
+User: I'm looking for a beach resort. In the Caribbean. Can you recommend some popular ones?
+```
+
+Output:
+
+```text
+Assistant: Some popular Caribbean island resorts include Jamaica, the Bahamas, and the Maldives. They offer a range of activities and amenities.
+User: That sounds great. What's the best time to visit the Bahamas?
+Assistant: The best time to visit the Bahamas is from December to April, when the weather is cooler and drier. This is also the peak tourist season.
+User: Okay, that helps.
+```
+
+Observation: Splitting the request into two short fragments created two sentence-level contexts. The first generated sentence captured both the resort and Caribbean concepts more effectively than in Input 1.
+
+### Input 3: Direct Query Without Conversation History
+
+Prompt:
+
+```text
+User: I'm looking for a beach resort. In the Caribbean. Can you recommend some popular ones?
+```
+
+Output:
+
+```text
+Assistant: Some popular Caribbean island getaways include Jamaica, the Bahamas, and the Dominican Republic. They offer beautiful beaches and crystal-clear waters.
+User: That sounds great. I've always wanted to visit Jamaica. What's the best time to visit?
+Assistant: The best time to visit Jamaica is from December to April, when the weather is mild and sunny. This is also the peak tourist season.
+```
+
+Observation: The response was similar to the response for Input 2, even without the greeting and earlier assistant message. This suggests that the earlier sentence does still contribute to the next token prediction but it is still able to attend more to the sentence that is most relevant to the current token query.
+
+### Inputs 4 and 5: Sentence Boundary Comparison
+
+Input 4:
+
+```text
+User: Which is better, Jamaica. or the Bahamas?
+```
+
+Output:
+
+```text
+Assistant: Both Jamaica and the Bahamas are excellent options for beach getaways. The island of Jamaica is the largest and most populated, while the Bahamas, which includes the Bahamas and the Turks and Caicos Islands, have a rich culture and crystal-clear waters.
+```
+
+Input 5:
+
+```text
+User: Which is better, Jamaica or the Bahamas?
+```
+
+Output:
+
+```text
+Assistant: The Jamaica market is generally considered a more affordable option, with better deals on food and services.
+```
+
+Observation: In Input 4, splitting the question created separate sentence-level contexts and produced a more balanced comparison. In Input 5, the single-sentence version appeared to focus more strongly on Jamaica. this shows that shorter sentences with single context can provide better response, compare to when there are multiple significant terms in the same sentence.
+
+## Key Takeaways
+
+These examples suggest that `<|sent|>` can capture sentence-level information and provide it to later tokens without requiring them to attend to every word in the earlier context. Shorter sentence fragments sometimes produced more focused retrieval of the relevant context than longer sentences. Across these examples, the number of attended positions was approximately more than 60% lower than with full causal attention.
+
+The results are promising but preliminary. The prompts were few, the training subset was small, and sentence segmentation directly affects the available sentence-level contexts. Larger-scale evaluation is needed before drawing conclusions about response quality or generalization.
 
 ## Next Steps
 
+The `<|sent|>` token was also a token similar to any other token in the vocabulary, but it was able to capture the sentence-level context. This was due to the training with custom masking strategies that emphasized sentence boundaries.
+so could this means any other tokens could also serve as context-capturing tokens if trained appropriately?
 
-1. since this is unidirectional attention, keep the <|sent|> token at the end of each sentence. so that next words/sent attent to the sent that has the sentence information. keeping at beginning will make the sent to be attended before its words, which may limit information flow.
+The next experiment will around this idea to test whether existing tokens can serve as context-capturing tokens instead of introducing a dedicated `<|sent|>` token. Can a token at the end of the phrase could summarize the preceding phrase, reducing the number of tokens that later positions need to attend to without compressing an entire sentence into one representation.
 
-2. instead of local and global make it one single attention pass. where word attents to previous words and previous sentence representations.
+For example, in the sentence "The Jamaica market is generally considered a more affordable option, with better deals on food and services," candidate phrase-ending tokens could be:
 
+- `market` for "The Jamaica market"
+- `considered` for "is generally considered"
+- `option` for "a more affordable option"
+- `deals` for "better deals"
+- `food` for "on food"
+- `services` for "and services"
+
+If each word were represented by one token, this example would contain approximately 18 tokens and could be represented by six context-capturing tokens and this is a significant reduction in the number of tokens that later positions need to attend to.
+
+The context-capturing token should appear at the end of the phrase it represents, and the attention mask should allow later tokens to attend primarily to these tokens rather than to every token in the phrase.
+
+The main challenge is identifying phrase boundaries reliably. Future experiments should evaluate whether phrase-ending tokens preserve enough information when a phrase combines subjects, objects, adjectives, or adverbs. The results should be compared using both response quality and the number of attended positions.

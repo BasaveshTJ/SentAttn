@@ -14,37 +14,44 @@ from sentence import (
 
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M-Instruct"
-FINETUNED_DIR = "./sentence-sparse-smollm2-135m-all"
+FINETUNED_DIR = "./sentence-sparse-smollm2-135m-edc"
 MAX_NEW_TOKENS = 100
 
-def attention_scores_per_step(seq_len, model):
+def attention_scores_per_step(allowed_mask, model):
     layers = int(model.config.num_hidden_layers)
     heads = int(model.config.num_attention_heads)
-    return layers * heads * seq_len * seq_len
+    return layers * heads * int(allowed_mask.sum().item())
 
 
-def latest_checkpoint(path):
+def causal_allowed_mask(attention_mask):
+    length = attention_mask.shape[1]
+    causal = torch.tril(torch.ones(length, length, dtype=torch.bool, device=attention_mask.device))
+    return causal[None] & attention_mask.bool()[:, None, :]
+
+
+def resolve_checkpoint_dirs(path):
+    # If path is a specific checkpoint, its tokenizer lives in the parent dir.
+    # If path is the parent dir, resolve to its latest checkpoint.
+    if os.path.basename(os.path.normpath(path)).startswith("checkpoint-"):
+        return path, os.path.dirname(os.path.normpath(path))
     checkpoints = sorted(glob.glob(os.path.join(path, "checkpoint-*")))
-    return checkpoints[-1] if checkpoints else path
+    return (checkpoints[-1] if checkpoints else path), path
 
 
 def load_sparse_model(device):
-    path = latest_checkpoint(FINETUNED_DIR)
-    if not os.path.exists(path):
+    checkpoint_dir, tokenizer_dir = resolve_checkpoint_dirs(FINETUNED_DIR)
+    if not os.path.exists(checkpoint_dir):
         raise FileNotFoundError(
-            f"Sparse model path not found: {path}. Train or point FINETUNED_DIR to a valid sparse checkpoint."
+            f"Sparse model path not found: {checkpoint_dir}. Train or point FINETUNED_DIR to a valid sparse checkpoint."
         )
-    source = path
-    tokenizer_source = source if os.path.exists(os.path.join(source, "tokenizer.json")) else FINETUNED_DIR
-    if not os.path.exists(os.path.join(tokenizer_source, "tokenizer.json")):
+    if not os.path.exists(os.path.join(tokenizer_dir, "tokenizer.json")):
         raise FileNotFoundError(
-            "Sparse tokenizer files not found in checkpoint or FINETUNED_DIR. "
-            "Save tokenizer with sparse model and retry."
+            f"Sparse tokenizer files not found in {tokenizer_dir}. Save tokenizer with sparse model and retry."
         )
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     tokenizer.add_special_tokens({"additional_special_tokens": [SENT_TOKEN]})
     model = SentenceSparseSmolLM2ForCausalLM.from_pretrained(
-        source, torch_dtype=torch.float16 if device == "cuda" else torch.float32
+        checkpoint_dir, torch_dtype=torch.float16 if device == "cuda" else torch.float32
     )
     model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
     model.set_sentence_token_id(tokenizer.convert_tokens_to_ids(SENT_TOKEN))
@@ -71,10 +78,11 @@ def run_full_attention(prompt, device):
     cumulative_attention_scores = 0
 
     for _ in range(MAX_NEW_TOKENS):
-        seq_len = current.shape[1]
-        cumulative_attention_scores += attention_scores_per_step(seq_len, model)
+        attention_mask = torch.ones_like(current)
+        allowed_mask = causal_allowed_mask(attention_mask)
+        cumulative_attention_scores += attention_scores_per_step(allowed_mask, model)
         with torch.no_grad():
-            logits = model(input_ids=current, attention_mask=torch.ones_like(current)).logits
+            logits = model(input_ids=current, attention_mask=attention_mask).logits
         next_id = int(logits[0, -1].argmax())
         generated.append(next_id)
         next_token = torch.tensor([[next_id]], device=device, dtype=current.dtype)
@@ -97,36 +105,28 @@ def run_sparse_attention(prompt, device):
         ids = tokenizer(add_system_sentence_token(text)).input_ids
     else:
         ids = tokenizer(add_sentence_tokens(prompt)).input_ids
-    sent_id = tokenizer.convert_tokens_to_ids(SENT_TOKEN)
-    structural = {
-        tokenizer.convert_tokens_to_ids(t)
-        for t in ("<|im_start|>", "<|im_end|>", "system", "user", "assistant")
-    }
-    last_sent = max((i for i, token in enumerate(ids) if token == sent_id), default=-1)
-    completed = [token for token in ids[:last_sent + 1] if token in structural or token == sent_id]
-    active = ids[last_sent + 1:]
+    # Recompute the sparse mask over the complete growing sequence every step.
+
+    current = list(ids)
     generated = []
     cumulative_attention_scores = 0
 
     for _ in range(MAX_NEW_TOKENS):
-        current = completed + active
-        cumulative_attention_scores += attention_scores_per_step(len(current), model)
         input_ids = torch.tensor([current], device=device)
+        attention_mask = torch.ones_like(input_ids)
+        allowed_mask = model.allowed_mask(input_ids, attention_mask)
+        cumulative_attention_scores += attention_scores_per_step(allowed_mask, model)
         with torch.no_grad():
             logits = model(
                 input_ids=input_ids,
-                attention_mask=torch.ones_like(input_ids),
+                attention_mask=attention_mask,
             )["logits"]
         next_id = int(logits[0, -1].argmax())
         generated.append(next_id)
-        if next_id == sent_id:
-            completed += [token for token in active if token in structural] + [next_id]
-            active = []
-        else:
-            active.append(next_id)
+        current.append(next_id)
 
     return {
-        "text": tokenizer.decode(generated, skip_special_tokens=True).strip(),
+        "text": tokenizer.decode(generated, skip_special_tokens=False).strip(),
         "cumulative_attention_scores": int(cumulative_attention_scores),
         "generated_tokens": len(generated),
     }
@@ -134,16 +134,24 @@ def run_sparse_attention(prompt, device):
 
 if __name__ == "__main__":
     prompt = [
-        {   "content": "Hi there", 
-            "role": "user"
-        },
-        {   "content": "Hello! How can I help you today?", 
-            "role": "assistant"
-        },
+        # {   "content": "Hi there", 
+        #     "role": "user"
+        # },
+        # {   "content": "Hello! How can I help you today?", 
+        #     "role": "assistant"
+        # },
+        # {
+        #     "content": "I'm looking for a beach resort. in the Caribbean. Can you recommend some popular ones?",
+        #     "role": "user",
+        # },
+        # {
+        #     "content": "Some popular Caribbean island resorts include Jamaica, the Bahamas, and the Maldives.  They offer a range of activities and amenities. ",
+        #     "role": "assistant"
+        # },
         {
-            "content": "I'm looking for a beach resort for my next vacation. Can you recommend some popular ones?",
-            "role": "user",
-        },
+            "content": "which is better, Jamaica or the Bahamas?",
+            "role": "user"
+        }
     ]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     full = run_full_attention(prompt, device)
@@ -157,3 +165,8 @@ if __name__ == "__main__":
     print("Sparse text:", sparse["text"])
     print("Sparse generated tokens:", sparse["generated_tokens"])
     print("Sparse cumulative attention scores:", sparse["cumulative_attention_scores"])
+
+
+
+# 202419000
+# 78999840

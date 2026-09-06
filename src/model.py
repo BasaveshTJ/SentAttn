@@ -17,7 +17,7 @@ class SentenceSparseSmolLM2ForCausalLM(LlamaForCausalLM):
         self.structural_token_ids = set(map(int, token_ids))
         self.config.structural_token_ids = list(self.structural_token_ids)
 
-    def _attention_bias(self, input_ids, attention_mask, dtype):
+    def allowed_mask(self, input_ids, attention_mask):
         bsz, length = input_ids.shape
         device = input_ids.device
         sent = input_ids.eq(self.sentence_token_id)
@@ -42,7 +42,12 @@ class SentenceSparseSmolLM2ForCausalLM(LlamaForCausalLM):
         allowed |= torch.eye(length, device=device, dtype=torch.bool)[None]
         if attention_mask is not None:
             allowed &= attention_mask.bool()[:, None, :]
-        bias = torch.full((bsz, 1, length, length), torch.finfo(dtype).min, device=device, dtype=dtype)
+        return allowed
+
+    def _attention_bias(self, input_ids, attention_mask, dtype):
+        bsz, length = input_ids.shape
+        allowed = self.allowed_mask(input_ids, attention_mask)
+        bias = torch.full((bsz, 1, length, length), torch.finfo(dtype).min, device=input_ids.device, dtype=dtype)
         return bias.masked_fill(allowed[:, None], 0.0)
 
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, labels=None, **kwargs):
@@ -79,6 +84,3 @@ class SentenceSparseSmolLM2ForCausalLM(LlamaForCausalLM):
                 loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
 
         return {"loss": loss, "logits": logits} if loss is not None else {"logits": logits}
-
-
-
