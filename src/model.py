@@ -43,6 +43,8 @@ class SentenceSparseSmolLM2ForCausalLM(LlamaForCausalLM):
         if attention_mask is not None:
             allowed &= attention_mask.bool()[:, None, :]
         return allowed
+        # retrun causul attention mask
+        # return torch.tril(torch.ones(length, length, dtype=torch.bool)).unsqueeze(0).to(device)
 
     def _attention_bias(self, input_ids, attention_mask, dtype):
         bsz, length = input_ids.shape

@@ -34,7 +34,7 @@ def add_system_sentence_token(text, sent_token=SENT_TOKEN):
     return text.replace("<|im_end|>", f"{sent_token}<|im_end|>", 1)
 
 
-def sample_run():
+def sample_sentence_run():
     prompt = [
         {   "content": "Hi there", 
             "role": "user"
@@ -86,5 +86,50 @@ def sample_run():
     return prompt
 
 
+#split the content into phrases for phrase-level processing
+def sample_phrase_run():
+    nlp = spacy.load("en_core_web_sm")
+    text = (
+        "The Jamaica market is generally considered a more affordable option, with better deals on food and services"
+        # "Hugging Face natively supports passing custom 4D attention masks directly into the .forward() pass of its Llama-based models."
+    )
+    doc = nlp(text)
+
+    phrases = []
+    current = []
+
+    for token in doc:
+        # Trigger a split when encountering key structural chunk boundaries:
+        # 1. Prepositions starting a prepositional phrase ('with', 'on')
+        # 2. Coordinating conjunctions ('and')
+        # 3. Auxiliaries/Verbs starting the predicate ('is')
+        # 4. Determiners starting a new noun phrase after a verb/adjective ('a')
+        is_split = (
+            (token.pos_ == "ADP" and token.dep_ in ("prep", "agent")) or
+            (token.pos_ == "CCONJ" and token.dep_ == "cc") or
+            (token.pos_ == "AUX" and current) or
+            (token.pos_ == "DET" and current and current[-1].pos_ in ("VERB", "ADV", "ADJ")) or
+            (token.dep_ in ("prep", "agent") and current) or
+            (token.text in ("directly", "natively") and current) or
+            (token.pos_ == "VERB" and current and current[-1].pos_ not in ("ADV", "AUX"))
+        )
+
+        if is_split and current:
+            phrase_text = " ".join([t.text for t in current]).strip(" ,")
+            if phrase_text:
+                phrases.append(phrase_text)
+            current = []
+
+        current.append(token)
+
+    if current:
+        phrase_text = " ".join([t.text for t in current]).strip(" ,")
+        if phrase_text:
+            phrases.append(phrase_text)
+
+    for p in phrases:
+        print(f'"{p}"')
 if __name__ == "__main__":
-    sample_run()
+    # sample_sentence_run()
+    sample_phrase_run()
+

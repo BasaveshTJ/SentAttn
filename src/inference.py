@@ -89,8 +89,9 @@ def run_full_attention(prompt, device):
         current = torch.cat([current, next_token], dim=1)
 
     return {
-        "text": tokenizer.decode(generated, skip_special_tokens=True).strip(),
-        "cumulative_attention_scores": int(cumulative_attention_scores),
+        "text": tokenizer.decode(generated, skip_special_tokens=False).strip(),
+        "cumulative_attention_scores": cumulative_attention_scores,
+        "Last_Token_Attention_Scores": attention_scores_per_step(allowed_mask, model),
         "generated_tokens": len(generated),
     }
 
@@ -127,7 +128,8 @@ def run_sparse_attention(prompt, device):
 
     return {
         "text": tokenizer.decode(generated, skip_special_tokens=False).strip(),
-        "cumulative_attention_scores": int(cumulative_attention_scores),
+        "cumulative_attention_scores": cumulative_attention_scores,
+        "Last_Token_Attention_Scores": attention_scores_per_step(allowed_mask, model),
         "generated_tokens": len(generated),
     }
 
@@ -159,11 +161,13 @@ if __name__ == "__main__":
     print("HuggingFaceTB/SmolLM2-135M-Instruct model results:")
     print("Full text:", full["text"])
     print("Full generated tokens:", full["generated_tokens"])
+    print("Full Last Token Attention Scores:", full["Last_Token_Attention_Scores"])
     print("Full cumulative attention scores:", full["cumulative_attention_scores"])
 
-    print("Sparse attention results:")
+    print("\n\nSparse attention results:")
     print("Sparse text:", sparse["text"])
     print("Sparse generated tokens:", sparse["generated_tokens"])
+    print("Sparse Last Token Attention Scores:", sparse["Last_Token_Attention_Scores"])
     print("Sparse cumulative attention scores:", sparse["cumulative_attention_scores"])
 
 
