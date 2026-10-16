@@ -1,7 +1,6 @@
 # SentAttn
 
 SentAttn explores sentence-aware sparse attention for decoder-only language models.
-SentAttn explores sentence-aware sparse attention for decoder-only language models.
 The core idea is to treat each sentence boundary token as a sentence context collector, so later tokens can read compact sentence context instead of all past word tokens.
 ## Overview
 
@@ -11,7 +10,9 @@ The core idea is to treat each sentence boundary token as a sentence context col
   - Insert `<|sent|>` at sentence boundaries.
   - Keep dense word-level attention inside the current sentence.
   - Let tokens attend to prior sentence markers as compact history.
-- Goal: reduce attention/KV cost while keeping response quality usable.
+- Goal: 
+  - reduce attention/KV cost while keeping response quality usable.
+  - check whether the model can process and retain information at a higher semantic level rather than relying on every individual word detail, similar to how human memory often preserves the meaning of a conversation without remembering it word by word.
 
 ### Current Direction 
 

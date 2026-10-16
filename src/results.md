@@ -234,6 +234,46 @@ It is observed that the responses are relevant, with only a few minor inaccuraci
 
 Using the same sparse-sentence model, causal attention mask was used instead of sentence-level attention mask. The output still remained largely consistent, indicating that the model had effectively learned to attend more to sentence boundaries.
 
+### Interactive Long-Context Comparison
+
+- Compared the full-attention and sentence-aware sparse models over multiple conversational turns.
+- Used the same interactive prompts and generation settings for both models.
+- Also evaluated greedy generation with `do_sample=False`.
+
+**Observation:**
+
+- Both models remain generally grammatical and can preserve the broad topic over several turns.
+- Both models enter repetition degradation in longer conversations, including during greedy generation. This indicates that repetition is not caused only by the sparse attention mask.
+- The base model itself is a small 135M-parameter model, so factual accuracy, entity tracking, long-context reasoning, and resistance to repetition are limited even with full attention.
+- The full-attention model also produced factual drift, repeated explanations, and incorrect answers. Therefore, some errors observed in the sparse model are inherited from the base model rather than introduced by sentence-level attention.
+- The sparse model produced a substantial reduction in KV-cache size and attended positions while usually preserving grammatical structure and the broad meaning of the conversation.
+- For example, 
+
+| Session | Turn | Full max/last KV tokens | Sparse max/last KV tokens |
+|---|---:|---:|---:|
+| A | 1 | 41 / 41 | 18 / 11 |
+| A | 2 | 185 / 185 | 45 / 25 |
+| A | 3 | 254 / 254 | 51 / 37 |
+| B | 1 | 41 / 41 | 18 / 11 |
+| B | 2 | 112 / 112 | 39 / 23 |
+| B | 3 | 241 / 241 | 53 / 35 |
+
+Across these six observed turns, the average maximum cache was approximately 146 tokens for full attention and 37 tokens for sparse attention. The average final cache was approximately 146 tokens for full attention and 24 tokens for sparse attention. These values are descriptive for the tested prompts rather than a general benchmark.
+
+The full-attention cache grows with the complete conversation because previous word tokens remain available. Its maximum and final cache sizes are therefore equal in these runs. The sparse cache also grows as new content is generated, but completed-sentence word tokens are removed after their sentence context has been collected. As a result, its maximum and final sizes remain much smaller and can differ when pruning occurs during generation. The sparse cache does not remain constant; it grows within active sentences and is reduced at sentence boundaries.
+
+The sparse model has an additional failure mode when exact retrieval is required. Removing completed-sentence word tokens preserves a compact sentence-level signal, but it does not preserve every word-level detail. This can affect:
+
+- exact names of previously recommended places,
+- numbers, dates, and ordered lists,
+- questions such as "which one?" or "the second option?",
+- references to a specific word from an older turn,
+- multi-step factual reasoning that requires several earlier details together.
+
+For example, after the model listed several beach destinations, a later question asking which one to choose could produce a generic destination rather than reliably selecting one of the previously listed options. Similarly, the sparse model could retain that an earlier turn discussed Caribbean resorts while losing the exact relationship between Jamaica, the Bahamas, and the other locations. This behavior is consistent with compressed sentence context, but it should not be interpreted as evidence that every quality issue comes from sparse attention because the full model showed related factual and repetition problems.
+
+More semantically meaningful compact units may reduce this problem. Sentence markers compress a complete sentence, which can be too coarse when a sentence contains several entities or facts. Phrase-level or clause-level context-capturing tokens could preserve smaller units such as an entity-description pair, a list item, or a factual relation. This may allow later tokens to retrieve fine-grained information without retaining every word token. However, phrase segmentation and training the selected tokens to store useful context remain important challenges. The benefit of this approach still requires controlled evaluation against sentence-level compression and full attention.
+
 
 ## Summary
 
@@ -242,6 +282,11 @@ Using the same sparse-sentence model, causal attention mask was used instead of 
 - Sentence context collector tokens, which also act as sentence boundary markers, can preserve useful compressed context.
 - Compression-first designs can lose critical token detail.
 - Segmentation quality is a major dependency.
+- The 135M-parameter base model has its own factual, long-context, and repetition limitations under full attention.
+- Both full and sparse models showed repetition degradation in longer conversations, including greedy generation.
+- Sparse attention can preserve broad meaning while losing exact word-level information needed for retrieval and precise cross-turn references.
+- As context grows, the full KV cache increases with the complete history, while the sparse KV cache grows within active sentences and shrinks when completed sentence tokens are pruned.
+- More semantically meaningful phrase- or clause-level compact units may preserve finer context than one representation for an entire sentence.
 - Current evidence is mostly qualitative and limited in sample size.
 
 ## Next Steps
